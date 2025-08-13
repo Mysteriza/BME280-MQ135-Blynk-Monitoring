@@ -1,226 +1,412 @@
+/***** ESP8266 + MQ135 (A0) + BME280 (I2C) + Blynk (non-blocking) *****
+ * Goals:
+ * - 5-min auto warm-up + baseline capture (no manual calibration).
+ * - IAQ Index (0..500) based on relative deviation from baseline (no fake "CO2 ppm").
+ * - Light T/RH compensation (conservative).
+ * - Median + EMA filtering; EEPROM baseline persistence; gentle baseline drift.
+ * - Non-blocking WiFi/Blynk (config/connect), periodic publish.
+ *********************************************************************/
+
 #define BLYNK_TEMPLATE_ID ""
 #define BLYNK_TEMPLATE_NAME ""
 
 #include <ESP8266WiFi.h>
 #include <BlynkSimpleEsp8266.h>
-#include <Adafruit_BME280.h> // Library for BME280 sensor
+#include <Adafruit_BME280.h>
+#include <Wire.h>
 #include <TimeLib.h>
 #include <WidgetRTC.h>
+#include <EEPROM.h>
 
-// Pin definitions
-// BME280 uses I2C (SDA=D2, SCL=D1 on NodeMCU ESP8266 by default), no explicit pin define needed
-#define MQ135_PIN A0        // Analog pin for MQ-135 sensor
-#define LED_PIN D0          // Onboard LED pin (active low)
+// --- Pins & Blynk VPins ---
+#define MQ135_PIN A0
+#define VP_TEMP V0
+#define VP_HUM V1
+#define VP_STATUS V2
+#define VP_BUTTON V3
+#define VP_TIME V4
+#define VP_MQ_RAW V5
+#define VP_IAQ V6
+#define VP_IAQ_STR V7
+#define VP_PRESS V8
+#define VP_ALT V9
 
-// WiFi and Blynk credentials
+// --- Credentials ---
 char auth[] = "";
 char ssid[] = "";
 char pass[] = "";
 
-// Initialize objects
-Adafruit_BME280 bme; // Create a BME280 object
+// --- Objects ---
+Adafruit_BME280 bme;
 BlynkTimer timer;
 WidgetRTC rtc;
 
-// Constants
-const float R0 = 400.0; // Initial baseline resistance (will adjust naturally over 24-48 hours)
-const float A_COEFFICIENT = 110.0; // Constant for CO2 (adjust based on calibration)
-const float B_COEFFICIENT = -2.5;   // Exponent for CO2 (adjust based on calibration)
-const float TEMP_BASELINE = 27.5;   // Adjusted to average room temperature based on your room
-const float HUMIDITY_BASELINE = 60.0; // Adjusted to average humidity based on your room
-const float TEMP_SENSITIVITY = 0.04; // Sensitivity to temperature change (approx. 4% per °C)
-const float HUMIDITY_SENSITIVITY = 0.02; // Sensitivity to humidity change (approx. 2% per %)
-const unsigned long RECONNECT_INTERVAL = 5000;       // 5 seconds for WiFi
-const unsigned long BLYNK_RECONNECT_INTERVAL = 10000; // 10 seconds for Blynk
-#define SEALEVEL_PRESSURE_HPA 1013.25 // Standard sea level pressure in hPa (millibars)
+// --- Timing ---
+const uint32_t T_SENSOR = 2000;
+const uint32_t T_PUBLISH = 10000;
+const uint32_t T_NETCHK = 5000;
+const uint32_t WARMUP_MS = 300000;
 
-// Reconnection variables
-unsigned long lastWiFiReconnectAttempt = 0;
-unsigned long lastBlynkReconnectAttempt = 0;
+// --- Filtering ---
+const int MQ_SAMPLES = 9;
+const float EMA_ALPHA = 0.20f;
 
-// LED control variables
-unsigned long ledStartTime = 0;
-bool ledActive = false;
+// --- Compensation ---
+const float T_REF = 25.0f;
+const float RH_REF = 50.0f;
+const float K_T = -0.010f;
+const float K_RH = 0.003f;
+const float COMP_MIN = 0.5f;
+const float COMP_MAX = 1.5f;
 
-// Check and reconnect WiFi
-void checkWiFi() {
-  if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiReconnectAttempt > RECONNECT_INTERVAL) {
-    lastWiFiReconnectAttempt = millis();
-    // Serial.println("WiFi disconnected. Attempting to reconnect...");
-    WiFi.disconnect();
+// --- IAQ mapping ---
+const float DEV_REF = 0.25f;
+const float GAMMA = 1.315f;
+
+// --- Baseline drift ---
+const uint32_t DRIFT_INTERVAL_MS = 600000;
+const float DRIFT_STEP_FRAC = 0.001f;
+const float DRIFT_GATE_DEV = 0.05f;
+
+// --- EEPROM layout ---
+struct Persist
+{
+  uint32_t magic;
+  uint16_t version;
+  float adc0;
+  uint32_t checksum;
+};
+const uint32_t MAGIC = 0xA135B135;
+const uint16_t VER = 1;
+const size_t EE_SZ = sizeof(Persist);
+
+// --- Globals ---
+float emaADC = NAN;
+float baselineADC = NAN;
+bool calibrated = false;
+bool warming = true;
+uint32_t t_start = 0;
+uint32_t lastDrift = 0;
+char bufMsg[64];
+const int WBUF_MAX = 180;
+float warmBuf[WBUF_MAX];
+int warmCnt = 0;
+
+// --- Utils ---
+static uint32_t sum32(const uint8_t *p, size_t n)
+{
+  uint32_t s = 0;
+  for (size_t i = 0; i < n; i++)
+    s += p[i];
+  return s;
+}
+
+void eepromLoad()
+{
+  EEPROM.begin(512);
+  Persist p;
+  EEPROM.get(0, p);
+  if (p.magic == MAGIC && p.version == VER)
+  {
+    uint32_t cs = p.checksum;
+    p.checksum = 0;
+    uint32_t calc = sum32((uint8_t *)&p, sizeof(Persist));
+    if (calc == cs && isfinite(p.adc0) && p.adc0 > 0.0f)
+    {
+      baselineADC = p.adc0;
+      calibrated = true;
+    }
+  }
+}
+
+void eepromSave(float adc0)
+{
+  Persist p;
+  p.magic = MAGIC;
+  p.version = VER;
+  p.adc0 = adc0;
+  p.checksum = 0;
+  p.checksum = sum32((uint8_t *)&p, sizeof(Persist));
+  EEPROM.put(0, p);
+  EEPROM.commit();
+}
+
+// --- Net/Blynk health ---
+void netTick()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
     WiFi.begin(ssid, pass);
-    Blynk.virtualWrite(V2, "WiFi Disconnected - Reconnecting...");
-    timer.setTimeout(5000L, []() {
-      if (WiFi.status() == WL_CONNECTED) {
-        // Serial.println("WiFi reconnected successfully!");
-        Blynk.virtualWrite(V2, "WiFi Reconnected!");
-      }
-    });
+    return;
+  }
+  if (!Blynk.connected())
+  {
+    Blynk.connect(2000);
   }
 }
 
-// Check and reconnect Blynk
-void checkBlynkConnection() {
-  if (!Blynk.connected() && millis() - lastBlynkReconnectAttempt > BLYNK_RECONNECT_INTERVAL) {
-    lastBlynkReconnectAttempt = millis();
-    // Serial.println("Blynk disconnected. Attempting to reconnect...");
-    Blynk.disconnect();
-    Blynk.begin(auth, ssid, pass);
-    Blynk.virtualWrite(V2, "Blynk Disconnected - Reconnecting...");
+// --- BME280 init ---
+bool initBME()
+{
+  if (bme.begin(0x76))
+    return true;
+  if (bme.begin(0x77))
+    return true;
+  return false;
+}
+
+// --- Median-of-N ADC read ---
+int readADCMedian(uint8_t pin)
+{
+  int v[MQ_SAMPLES];
+  for (int i = 0; i < MQ_SAMPLES; i++)
+  {
+    v[i] = analogRead(pin);
+    delay(2);
   }
-}
-
-// Read MQ-135 with averaging
-float readMQ135() {
-  const int SAMPLES = 5;
-  int total = 0;
-  for (int i = 0; i < SAMPLES; i++) {
-    total += analogRead(MQ135_PIN);
-    delay(10);
+  for (int i = 1; i < MQ_SAMPLES; i++)
+  {
+    int key = v[i], j = i - 1;
+    while (j >= 0 && v[j] > key)
+    {
+      v[j + 1] = v[j];
+      j--;
+    }
+    v[j + 1] = key;
   }
-  return total / (float)SAMPLES;
+  return v[MQ_SAMPLES / 2];
 }
 
-// Calculate compensated gas concentration in ppm
-float calculateCompensatedGas(float raw_gas, float temperature, float humidity) {
-  // Adjust raw gas reading based on temperature and humidity
-  float tempFactor = 1.0 + ((temperature - TEMP_BASELINE) * TEMP_SENSITIVITY);
-  float humidFactor = 1.0 + ((humidity - HUMIDITY_BASELINE) * HUMIDITY_SENSITIVITY);
-  float adjustedRs = raw_gas * tempFactor * humidFactor;
-
-  // Convert to gas concentration (ppm) using simplified MQ-135 model
-  // Serial.print("Debug - adjustedRs: "); Serial.print(adjustedRs);
-  // Serial.print(", ratio: "); Serial.println(adjustedRs / R0);
-  float ratio = adjustedRs / R0;
-  float concentration = A_COEFFICIENT * pow(ratio, B_COEFFICIENT);
-
-  // Limit to realistic range for CO2 (10-1000 ppm)
-  return constrain(concentration, 10.0, 1000.0);
+// --- Compensation factor ---
+float compFactor(float tC, float rh)
+{
+  float cf = 1.0f + K_T * (tC - T_REF) + K_RH * (rh - RH_REF);
+  if (cf < COMP_MIN)
+    cf = COMP_MIN;
+  if (cf > COMP_MAX)
+    cf = COMP_MAX;
+  return cf;
 }
 
-// Get air quality status based on gas concentration
-String getAirQualityStatus(float compensated_gas) {
-  if (compensated_gas <= 400) return "Very Good";   // ~400 ppm is typical outdoor CO2
-  if (compensated_gas <= 600) return "Good";
-  if (compensated_gas <= 800) return "Fair";
-  if (compensated_gas <= 1000) return "Poor";
+// --- IAQ mapping ---
+float iaqIndexFromDev(float dev)
+{
+  if (dev < 0)
+    dev = -dev;
+  float r = dev / DEV_REF;
+  if (r < 0)
+    r = 0;
+  if (r > 1)
+    r = 1;
+  float idx = 500.0f * powf(r, GAMMA);
+  if (idx < 0)
+    idx = 0;
+  if (idx > 500)
+    idx = 500;
+  return idx;
+}
+
+const char *iaqLabel(float idx)
+{
+  if (idx <= 50)
+    return "Very Good";
+  if (idx <= 100)
+    return "Good";
+  if (idx <= 150)
+    return "Fair";
+  if (idx <= 200)
+    return "Poor";
   return "Very Poor";
 }
 
-// Check if it's night time (19:00 to 07:00)
-bool isNightTime() {
-  if (!timeStatus() == timeSet) return false; // Default to daytime if time not synced
-  int currentHour = hour();
-  return (currentHour >= 19 || currentHour < 7);
+// --- Gentle baseline drift ---
+void tryDrift(float devAbs)
+{
+  if (!calibrated)
+    return;
+  if (millis() - lastDrift < DRIFT_INTERVAL_MS)
+    return;
+  lastDrift = millis();
+  if (devAbs < DRIFT_GATE_DEV && isfinite(emaADC) && emaADC > 0.0f)
+  {
+    float delta = DRIFT_STEP_FRAC * baselineADC;
+    if (emaADC > baselineADC)
+      baselineADC = baselineADC + delta;
+    else
+      baselineADC = baselineADC - delta;
+    eepromSave(baselineADC);
+  }
 }
 
-// Handle LED blinking or solid on (non-blocking)
-void updateLED(bool sensorFailure, bool poorAirQuality) {
-  if (isNightTime() || ledActive) return; // Skip if night mode or LED already active
+// --- Sensor tick ---
+float lastTemp = NAN, lastHum = NAN, lastPress = NAN, lastAlt = NAN;
+float lastADCraw = NAN, lastIAQ = NAN;
+String lastIAQStr = "Unknown";
 
-  if (sensorFailure) {
-    ledActive = true;
-    ledStartTime = millis();
-    timer.setTimer(500L, []() {
-      static int blinkCount = 0;
-      digitalWrite(LED_PIN, !digitalRead(LED_PIN)); // Toggle LED
-      blinkCount++;
-      if (blinkCount >= 6) { // 3 full blinks (6 toggles)
-        digitalWrite(LED_PIN, HIGH);
-        ledActive = false;
-        blinkCount = 0;
-        return false; // Stop timer
+void sensorTick()
+{
+  float t = bme.readTemperature();
+  float h = bme.readHumidity();
+  float p = bme.readPressure() / 100.0f;
+  float a = bme.readAltitude(1013.25f);
+
+  if (isnan(t) || isnan(h) || isnan(p) || isnan(a))
+  {
+    snprintf(bufMsg, sizeof(bufMsg), "BME280 read failed");
+    Blynk.virtualWrite(VP_STATUS, bufMsg);
+    return;
+  }
+
+  int adc = readADCMedian(MQ135_PIN);
+  if (adc <= 0 || adc >= 1023)
+  {
+    snprintf(bufMsg, sizeof(bufMsg), "MQ135 saturated: %d", adc);
+    Blynk.virtualWrite(VP_STATUS, bufMsg);
+    return;
+  }
+
+  float x = (float)adc;
+  if (isnan(emaADC))
+    emaADC = x;
+  else
+    emaADC = EMA_ALPHA * x + (1.0f - EMA_ALPHA) * emaADC;
+
+  uint32_t elapsed = millis() - t_start;
+  if (warming)
+  {
+    if (warmCnt < WBUF_MAX)
+      warmBuf[warmCnt++] = emaADC;
+    if (elapsed >= WARMUP_MS)
+    {
+      for (int i = 1; i < warmCnt; i++)
+      {
+        float key = warmBuf[i];
+        int j = i - 1;
+        while (j >= 0 && warmBuf[j] > key)
+        {
+          warmBuf[j + 1] = warmBuf[j];
+          j--;
+        }
+        warmBuf[j + 1] = key;
       }
-      return true; // Continue timer
-    }, 6);
-  } else if (poorAirQuality) {
-    ledActive = true;
-    digitalWrite(LED_PIN, LOW);
-    timer.setTimeout(3000L, []() {
-      digitalWrite(LED_PIN, HIGH);
-      ledActive = false;
-    });
+      baselineADC = warmBuf[warmCnt / 2];
+      if (!isfinite(baselineADC) || baselineADC <= 0)
+        baselineADC = emaADC;
+      eepromSave(baselineADC);
+      warming = false;
+      calibrated = true;
+      snprintf(bufMsg, sizeof(bufMsg), "Warm-up done. Baseline=%.1f", baselineADC);
+      Blynk.virtualWrite(VP_STATUS, bufMsg);
+    }
+    else
+    {
+      int secs = (WARMUP_MS - elapsed) / 1000;
+      snprintf(bufMsg, sizeof(bufMsg), "Warming up... %ds", secs);
+      Blynk.virtualWrite(VP_STATUS, bufMsg);
+    }
+  }
+  else
+  {
+    float cf = compFactor(t, h);
+    float adcComp = emaADC * cf;
+    float dev = (baselineADC > 1.0f) ? (adcComp - baselineADC) / baselineADC : 0.0f;
+    float devAbs = fabsf(dev);
+    float iaq = iaqIndexFromDev(devAbs);
+    const char *lbl = iaqLabel(iaq);
+
+    lastTemp = t;
+    lastHum = h;
+    lastPress = p;
+    lastAlt = a;
+    lastADCraw = emaADC;
+    lastIAQ = iaq;
+    lastIAQStr = lbl;
+
+    tryDrift(devAbs);
   }
 }
 
-// Send sensor data to Blynk
-void sendSensorData() {
-  float temperature = bme.readTemperature();
-  float humidity = bme.readHumidity();
-  float pressure = bme.readPressure() / 100.0F; // Convert Pa to hPa (millibars)
-  float altitude = bme.readAltitude(SEALEVEL_PRESSURE_HPA); // Calculate altitude based on sea level pressure
-
-  if (isnan(temperature) || isnan(humidity) || isnan(pressure) || isnan(altitude)) {
-    // Serial.println("Failed to read from BME280 sensor!");
-    Blynk.virtualWrite(V2, "Failed to read from BME280 sensor!");
-    updateLED(true, false);
+// --- Publish tick ---
+void publishTick()
+{
+  if (!Blynk.connected())
     return;
+
+  if (isfinite(lastTemp))
+    Blynk.virtualWrite(VP_TEMP, lastTemp);
+  if (isfinite(lastHum))
+    Blynk.virtualWrite(VP_HUM, lastHum);
+  if (isfinite(lastPress))
+    Blynk.virtualWrite(VP_PRESS, lastPress);
+  if (isfinite(lastAlt))
+    Blynk.virtualWrite(VP_ALT, lastAlt);
+
+  if (!warming && calibrated)
+  {
+    if (isfinite(lastADCraw))
+      Blynk.virtualWrite(VP_MQ_RAW, lastADCraw);
+    if (isfinite(lastIAQ))
+      Blynk.virtualWrite(VP_IAQ, lastIAQ);
+    Blynk.virtualWrite(VP_IAQ_STR, lastIAQStr);
+    Blynk.virtualWrite(VP_STATUS, "OK");
   }
 
-  float raw_gas = readMQ135();
-  if (raw_gas < 0 || raw_gas > 1023) {
-    // Serial.println("Failed to read from MQ-135 sensor!");
-    Blynk.virtualWrite(V2, "Invalid MQ-135 sensor reading!");
-    updateLED(true, false);
-    return;
+  if (timeStatus() == timeSet)
+  {
+    char ts[6];
+    snprintf(ts, sizeof(ts), "%02d:%02d", hour(), minute());
+    Blynk.virtualWrite(VP_TIME, ts);
   }
-
-  float compensated_gas = calculateCompensatedGas(raw_gas, temperature, humidity);
-  String airQualityStatus = getAirQualityStatus(compensated_gas);
-
-  updateLED(false, compensated_gas > 800); // Adjusted threshold for poor air quality
-
-  Blynk.virtualWrite(V0, temperature);
-  Blynk.virtualWrite(V1, humidity);
-  Blynk.virtualWrite(V8, pressure);   // New Virtual Pin for Pressure
-  Blynk.virtualWrite(V9, altitude);   // New Virtual Pin for Altitude
-  Blynk.virtualWrite(V5, raw_gas);
-  Blynk.virtualWrite(V6, compensated_gas);
-  Blynk.virtualWrite(V7, airQualityStatus);
-
-  char timeStr[6];
-  sprintf(timeStr, "%02d:%02d", hour(), minute());
-  Blynk.virtualWrite(V4, timeStr);
-
-  Blynk.virtualWrite(V2, "Latest Update!");
 }
 
-void setup() {
-  // Serial.begin(115200); // Uncomment for debugging
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH); // Turn off LED initially (active low)
-
-  // Initialize BME280
-  // Default I2C address is 0x76 or 0x77.
-  // bme.begin() returns true on success, false otherwise.
-  if (!bme.begin(0x76)) { // Try 0x76 first, or 0x77 if 0x76 doesn't work
-    // Serial.println("Could not find a valid BME280 sensor, check wiring!");
-    while (1); // Halt if sensor not found
-  }
-
-  Blynk.begin(auth, ssid, pass);
+// --- Blynk handlers ---
+BLYNK_CONNECTED()
+{
   rtc.begin();
-
-  timer.setInterval(20000L, sendSensorData);
-  timer.setInterval(5000L, checkWiFi);
-  timer.setInterval(10000L, checkBlynkConnection);
+  Blynk.virtualWrite(VP_STATUS, "Connected to Blynk");
 }
 
-void loop() {
+BLYNK_WRITE(VP_BUTTON)
+{
+  if (param.asInt() == 1)
+  {
+    publishTick();
+    Blynk.virtualWrite(VP_BUTTON, 0);
+  }
+}
+
+// --- Setup/Loop ---
+void setup()
+{
+  eepromLoad();
+  if (isfinite(baselineADC) && baselineADC > 0)
+  {
+    warming = false;
+    calibrated = true;
+  }
+
+  if (!initBME())
+  {
+    for (;;)
+    {
+      delay(800);
+    }
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+  Blynk.config(auth);
+
+  t_start = millis();
+  lastDrift = millis();
+
+  timer.setInterval(T_SENSOR, sensorTick);
+  timer.setInterval(T_PUBLISH, publishTick);
+  timer.setInterval(T_NETCHK, netTick);
+}
+
+void loop()
+{
   Blynk.run();
   timer.run();
-}
-
-BLYNK_WRITE(V3) {
-  // This virtual pin can be used to manually trigger sensor data send from Blynk app.
-  if (param.asInt() == 1) {
-    sendSensorData();
-    Blynk.virtualWrite(V3, 0); // Reset the button in Blynk app
-  }
-}
-
-BLYNK_CONNECTED() {
-  rtc.begin();
-  // Serial.println("Connected to Blynk!");
-  Blynk.virtualWrite(V2, "Connected to Blynk!");
 }
