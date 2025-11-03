@@ -1,8 +1,7 @@
 /***** ESP8266 + MQ135 (A0) + BME280 (I2C) + Blynk (non-blocking)
  * Minimal telemetry: Temperature, Humidity, Pressure, MQ135 Raw
- * - No altitude, no IAQ index, no IAQ status
- * - Median + EMA filtering for MQ135; light EMA for pressure
- * - Fast, simple, and robust networking (non-blocking)
+ * - Median + EMA filtering (MQ135), light EMA (pressure)
+ * - Robust reconnect: non-blocking + adaptive backoff
  *********************************************************************/
 
 #define BLYNK_TEMPLATE_ID   "TMPLxyk260wi"
@@ -36,9 +35,9 @@ BlynkTimer timer;
 WidgetRTC rtc;
 
 // -------- Timing (ms) --------
-const uint32_t T_SENSOR   = 1500;    // faster sensor tick
-const uint32_t T_PUBLISH  = 3000;    // faster publish
-const uint32_t T_NETCHK   = 4000;    // network health
+const uint32_t T_SENSOR   = 2000;   // sensor read interval
+const uint32_t T_PUBLISH  = 4000;   // send to Blynk
+const uint32_t T_NETCHK   = 2000;   // network health tick
 
 // -------- Filtering --------
 const int   MQ_SAMPLES   = 9;        // median-of-N
@@ -49,10 +48,21 @@ const float P_EMA_ALPHA  = 0.10f;    // pressure EMA
 float lastTemp  = NAN, lastHum = NAN;
 float lastPress = NAN, pressEMA = NAN;
 float lastADCraw = NAN;
-char  bufMsg[48];
+
+// -------- Adaptive backoff (WiFi & Blynk) --------
+uint32_t wifiBackoffMs  = 1000;      // start 1s
+uint32_t blynkBackoffMs = 1000;      // start 1s
+const uint32_t WIFI_BACKOFF_MIN   = 1000;
+const uint32_t WIFI_BACKOFF_MAX   = 30000;   // cap 30s
+const uint32_t BLYNK_BACKOFF_MIN  = 1000;
+const uint32_t BLYNK_BACKOFF_MAX  = 30000;   // cap 30s
+uint32_t nextWifiAttemptAt  = 0;
+uint32_t nextBlynkAttemptAt = 0;
 
 // -------- Utils --------
-bool initBME() { return bme.begin(0x76) || bme.begin(0x77); }
+bool initBME() {
+  return bme.begin(0x76) || bme.begin(0x77);
+}
 
 int readADCMedian(uint8_t pin) {
   int v[MQ_SAMPLES];
@@ -61,38 +71,71 @@ int readADCMedian(uint8_t pin) {
   return v[MQ_SAMPLES/2];
 }
 
+// -------- Robust non-blocking reconnect --------
+inline uint32_t nowMs() { return millis(); }
+
+void scheduleNextWifiAttempt(bool success) {
+  if (success) { wifiBackoffMs = WIFI_BACKOFF_MIN; }
+  else { wifiBackoffMs = min(WIFI_BACKOFF_MAX, wifiBackoffMs << 1); }
+  nextWifiAttemptAt = nowMs() + wifiBackoffMs;
+}
+
+void scheduleNextBlynkAttempt(bool success) {
+  if (success) { blynkBackoffMs = BLYNK_BACKOFF_MIN; }
+  else { blynkBackoffMs = min(BLYNK_BACKOFF_MAX, blynkBackoffMs << 1); }
+  nextBlynkAttemptAt = nowMs() + blynkBackoffMs;
+}
+
 void netTick() {
-  if (WiFi.status() != WL_CONNECTED) { WiFi.begin(ssid, pass); return; }
-  if (!Blynk.connected()) { Blynk.connect(2000); }
+  // WiFi: try with adaptive backoff
+  if (WiFi.status() != WL_CONNECTED) {
+    if (nowMs() >= nextWifiAttemptAt) {
+      WiFi.begin(ssid, pass);
+      scheduleNextWifiAttempt(false);   // assume fail; reset on success below
+    }
+    return; // don't try Blynk until WiFi is up
+  } else {
+    // On connect: reset WiFi backoff
+    if (wifiBackoffMs != WIFI_BACKOFF_MIN) scheduleNextWifiAttempt(true);
+  }
+
+  // Blynk: try with adaptive backoff (short timeout, non-blocking)
+  if (!Blynk.connected()) {
+    if (nowMs() >= nextBlynkAttemptAt) {
+      bool ok = Blynk.connect(1500);    // 1.5s budget
+      scheduleNextBlynkAttempt(ok);
+      if (ok) Blynk.virtualWrite(VP_STATUS, "Connected to Blynk");
+    }
+  } else {
+    // On connect: reset Blynk backoff
+    if (blynkBackoffMs != BLYNK_BACKOFF_MIN) scheduleNextBlynkAttempt(true);
+  }
 }
 
 // -------- Sensor tick --------
 void sensorTick() {
   float t = bme.readTemperature();
   float h = bme.readHumidity();
-  float p = bme.readPressure() / 100.0f;   // hPa
+  float p = bme.readPressure() / 100.0f; // hPa
 
   if (isnan(t) || isnan(h) || isnan(p)) {
     Blynk.virtualWrite(VP_STATUS, "BME280 read failed");
     return;
   }
 
-  // Pressure EMA (stable display)
   if (isnan(pressEMA)) pressEMA = p;
   else pressEMA = P_EMA_ALPHA*p + (1.0f - P_EMA_ALPHA)*pressEMA;
 
-  // MQ135 median -> EMA
   int adc = readADCMedian(MQ135_PIN);
   if (adc <= 0 || adc >= 1023) {
-    snprintf(bufMsg, sizeof(bufMsg), "MQ135 saturated: %d", adc);
-    Blynk.virtualWrite(VP_STATUS, bufMsg);
+    Blynk.virtualWrite(VP_STATUS, "MQ135 saturated");
     return;
   }
+
   float x = (float)adc;
   if (isnan(lastADCraw)) lastADCraw = x;
   else lastADCraw = EMA_ALPHA*x + (1.0f-EMA_ALPHA)*lastADCraw;
 
-  // Store latest
   lastTemp = t; lastHum = h; lastPress = pressEMA;
 }
 
@@ -124,10 +167,18 @@ BLYNK_WRITE(VP_BUTTON) {
 
 // -------- Setup/Loop --------
 void setup() {
-  if (!initBME()) { for(;;){ delay(800); } }   // fatal: halt with soft wait
+  if (!initBME()) { for(;;){ delay(800); } }   // fatal: halt softly
+
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);          // don't write creds repeatedly to flash
+  WiFi.setAutoReconnect(true);     // let SDK also try in background
   WiFi.begin(ssid, pass);
-  Blynk.config(auth);
+
+  Blynk.config(auth);              // non-blocking; we'll connect in netTick()
+
+  // seed backoff windows
+  scheduleNextWifiAttempt(false);
+  scheduleNextBlynkAttempt(false);
 
   timer.setInterval(T_SENSOR,  sensorTick);
   timer.setInterval(T_PUBLISH, publishTick);
