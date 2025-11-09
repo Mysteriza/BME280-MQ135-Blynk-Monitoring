@@ -87,7 +87,7 @@ void scheduleNextBlynkAttempt(bool success) {
 }
 
 void netTick() {
-  // WiFi: try with adaptive backoff
+  // WiFi: adaptive backoff
   if (WiFi.status() != WL_CONNECTED) {
     if (nowMs() >= nextWifiAttemptAt) {
       WiFi.begin(ssid, pass);
@@ -95,19 +95,17 @@ void netTick() {
     }
     return; // don't try Blynk until WiFi is up
   } else {
-    // On connect: reset WiFi backoff
     if (wifiBackoffMs != WIFI_BACKOFF_MIN) scheduleNextWifiAttempt(true);
   }
 
-  // Blynk: try with adaptive backoff (short timeout, non-blocking)
+  // Blynk: adaptive backoff (short timeout)
   if (!Blynk.connected()) {
     if (nowMs() >= nextBlynkAttemptAt) {
-      bool ok = Blynk.connect(1500);    // 1.5s budget
+      bool ok = Blynk.connect(1500);
       scheduleNextBlynkAttempt(ok);
       if (ok) Blynk.virtualWrite(VP_STATUS, "Connected to Blynk");
     }
   } else {
-    // On connect: reset Blynk backoff
     if (blynkBackoffMs != BLYNK_BACKOFF_MIN) scheduleNextBlynkAttempt(true);
   }
 }
@@ -150,8 +148,10 @@ void publishTick() {
 
   Blynk.virtualWrite(VP_STATUS, "OK");
 
+  // Timestamp with seconds (HH:MM:SS)
   if (timeStatus() == timeSet) {
-    char ts[6]; snprintf(ts, sizeof(ts), "%02d:%02d", hour(), minute());
+    char ts[9];
+    snprintf(ts, sizeof(ts), "%02d:%02d:%02d", hour(), minute(), second());
     Blynk.virtualWrite(VP_TIME, ts);
   }
 }
@@ -170,11 +170,11 @@ void setup() {
   if (!initBME()) { for(;;){ delay(800); } }   // fatal: halt softly
 
   WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);          // don't write creds repeatedly to flash
-  WiFi.setAutoReconnect(true);     // let SDK also try in background
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, pass);
 
-  Blynk.config(auth);              // non-blocking; we'll connect in netTick()
+  Blynk.config(auth);  // connect handled in netTick()
 
   // seed backoff windows
   scheduleNextWifiAttempt(false);
