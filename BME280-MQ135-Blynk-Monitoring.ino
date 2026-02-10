@@ -33,6 +33,10 @@ const int   MQ_SAMPLES   = 9;
 const float EMA_ALPHA    = 0.08f;
 const float P_EMA_ALPHA  = 0.10f;
 
+// -------- Watchdog --------
+const uint32_t WATCHDOG_TIMEOUT = 1800000; // 30 mins
+uint32_t lastConnectedMs = 0;
+
 float lastTemp  = NAN;
 float lastHum = NAN;
 float lastPress = NAN;
@@ -113,12 +117,20 @@ void netTick() {
       scheduleNextBlynkAttempt(ok);
       if (ok) {
         Blynk.virtualWrite(VP_STATUS, "Connected to Blynk");
+        lastConnectedMs = nowMs(); // Update watchdog
       }
     }
   } else {
+    // Already connected
+    lastConnectedMs = nowMs(); // Keep watchdog happy
     if (blynkBackoffMs != BLYNK_BACKOFF_MIN) {
       scheduleNextBlynkAttempt(true);
     }
+  }
+
+  // Check watchdog
+  if (nowMs() - lastConnectedMs > WATCHDOG_TIMEOUT) {
+    ESP.restart();
   }
 }
 
@@ -214,7 +226,11 @@ void setup() {
   scheduleNextWifiAttempt(false);
   scheduleNextBlynkAttempt(false);
 
+  // Init watchdog
+  lastConnectedMs = nowMs();
+
   timer.setInterval(T_SENSOR,  sensorTick);
+
   timer.setInterval(T_PUBLISH, publishTick);
   timer.setInterval(T_NETCHK,  netTick);
 }
